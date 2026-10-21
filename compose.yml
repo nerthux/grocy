@@ -1,0 +1,56 @@
+# El compose del despliegue, desde ~/Projects/infra/plantillas/base/compose.yml.
+# Lo común a todos los entornos; producción va encima con compose.prod.yml
+# (COMPOSE_FILE=compose.yml:compose.prod.yml en el .env). El .env lo escribe
+# deploy.yml de infra en el servidor; la prueba local de la imagen es
+# compose.local.yml.
+#
+# El nombre del proyecto sale de COMPOSE_PROJECT_NAME, grocy-<entorno>, y es
+# también el nombre del router en Traefik y el prefijo del volumen.
+
+services:
+  app:
+    image: ${APP_IMAGE:?falta APP_IMAGE en .env}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # A la app sólo llega lo que se nombra aquí. Sin Postgres, correo ni
+    # Supabase: Grocy usa SQLite en data/.
+    environment:
+      APP_ENV: ${APP_ENV:?falta APP_ENV en .env}
+      APP_URL: https://${APP_HOST}
+      # Detrás de Traefik, Grocy no ve el https ni el host público; sin esto
+      # arma sus enlaces y redirecciones con lo que le llega de nginx
+      GROCY_BASE_URL: https://${APP_HOST}
+    # data/ (grocy.db, config.php y las fotos) vive en el volumen:
+    # grocy-<entorno>_datos en el servidor
+    volumes:
+      - datos:/var/www/grocy/data
+    # Sin ports: sólo Traefik publica puertos.
+    networks:
+      - proxy
+      - default
+    healthcheck:
+      # APP_HEALTH_PATH es /login: / redirige a GROCY_BASE_URL, que desde
+      # dentro del contenedor no existe
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${APP_PORT}${APP_HEALTH_PATH:-/}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    labels:
+      - traefik.enable=true
+      # La app está en dos redes: Traefik la busca en proxy.
+      - traefik.docker.network=proxy
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME:?falta COMPOSE_PROJECT_NAME en .env}.rule=Host(`${APP_HOST:?falta APP_HOST en .env}`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints=websecure
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls=true
+      - traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=${APP_PORT:?falta APP_PORT en .env}
+
+networks:
+  # La red de Traefik.
+  proxy:
+    external: true
+  default: {}
+
+volumes:
+  datos: {}

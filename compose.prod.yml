@@ -1,0 +1,13 @@
+# Capa de producción, desde ~/Projects/infra/plantillas/base/compose.prod.yml.
+# Va encima de compose.yml con COMPOSE_FILE=compose.yml:compose.prod.yml en
+# el .env.
+#
+# Sin límites de CPU ni RAM (infra DEC-010) y sin basic auth: producción es
+# pública.
+
+services:
+  app:
+    labels:
+      # infra DEC-028 y DEC-100: el certificado de producción sale del
+      # resolver HTTP-01, que en los dos servidores se llama produccion.
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver=produccion

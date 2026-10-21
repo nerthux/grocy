@@ -1,5 +1,5 @@
-# Prueba local de la imagen propia. No es el compose del despliegue: ése será
-# compose.yml, con la plantilla de infra. Se parametriza con .env (ver
+# Prueba local de la imagen propia. No es el compose del despliegue: ése es
+# compose.yml (+ compose.prod.yml), con la plantilla de infra. Se parametriza con .env (ver
 # .env.example); con COMPOSE_FILE ahí, basta `docker compose up`.
 
 services:
