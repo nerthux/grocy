@@ -31,6 +31,7 @@ FROM php:8.5-fpm-trixie
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends \
 		nginx \
+		wget \
 		libfreetype6 libjpeg62-turbo libpng16-16t64 libwebp7 libicu76 \
 		libfreetype-dev libjpeg62-turbo-dev libpng-dev libwebp-dev libicu-dev \
 	&& docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
