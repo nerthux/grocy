@@ -1,0 +1,16 @@
+.git
+.github
+.devtools
+.vscode
+.tx
+.release
+docs
+changelog/__TEMPLATE.md
+packages
+public/packages
+node_modules
+data/*
+!data/.htaccess
+!data/plugins
+Dockerfile
+.dockerignore
