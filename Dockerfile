@@ -45,5 +45,13 @@ COPY --from=composer /build/packages packages
 COPY --from=yarn /build/public/packages public/packages
 RUN chown -R www-data:www-data data
 
-EXPOSE 80
-CMD ["php-fpm"]
+RUN cp "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
+COPY docker/php.ini "$PHP_INI_DIR/conf.d/zz-grocy.ini"
+COPY docker/php-fpm.conf /usr/local/etc/php-fpm.d/zz-grocy.conf
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/grocy-entrypoint
+
+# Ni nginx ni php-fpm corren como root
+USER www-data
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/grocy-entrypoint"]
