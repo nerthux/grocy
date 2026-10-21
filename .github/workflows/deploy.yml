@@ -1,0 +1,301 @@
+# 6.3: el deploy reutilizable. Entra por SSH como `deploy` al servidor del
+# proyecto (la variable SERVIDOR del repo, DEC-101) y, en
+# /srv/<proyecto>/<entorno>/: copia los compose*.yml del
+# repo (DEC-025), escribe el .env desde los secretos del Environment (6.8, en
+# 600), hace login en GHCR con el GITHUB_TOKEN del run, `pull`, la migración
+# (DEC-046: con Supabase, el CLI desde el runner contra DIRECT_URL; si no,
+# como contenedor de una sola vez con la imagen, DEC-048) y, sólo si sale 0,
+# `up -d --wait`; al final comprueba que lo que corre es la imagen pedida y
+# que responde en su ruta de salud. Lo llaman build.yml, produccion.yml y rollback.yml
+# con workflow_call; no corre solo. Es el mismo para todos los stacks: lo que
+# cambia por proyecto va en `with:`. Se copia tal cual a
+# .github/workflows/deploy.yml del repo del proyecto.
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      entorno:
+        description: "staging, prod o dev-<tema>: el directorio en /srv y, si no se da `environment`, el Environment de GitHub"
+        type: string
+        required: true
+      environment:
+        description: "El Environment de GitHub de donde salen los secretos, si no es `entorno`: todos los dev-<tema> usan `dev` (6.4)"
+        type: string
+        default: ""
+      proyecto:
+        description: "El slug del proyecto (docs/PLAN_cicd.md §2): /srv/<proyecto>/ y <proyecto>-<entorno> en Compose"
+        type: string
+        required: true
+      host:
+        description: "APP_HOST: el nombre por el que responde el entorno"
+        type: string
+        required: true
+      imagen:
+        description: "APP_IMAGE: ghcr.io/<org>/<proyecto>:<sha>, del job build"
+        type: string
+        required: true
+      app_env:
+        description: "APP_ENV: prod, staging o dev"
+        type: string
+        required: true
+      compose_file:
+        description: "COMPOSE_FILE: las capas del entorno (plantillas/base/README.md)"
+        type: string
+        required: true
+      puerto:
+        description: "APP_PORT: donde escucha la app dentro del contenedor"
+        type: string
+        default: "3000"
+      ruta_salud:
+        description: "APP_HEALTH_PATH: la ruta que responde 200 sin tocar la base"
+        type: string
+        default: "/"
+      migrar:
+        description: "Django, FastAPI: el comando de migración, corrido con `sh -c` dentro de la imagen antes del up (DEC-046); vacío si no hay. Sin comillas simples."
+        type: string
+        default: ""
+      migrar_supabase:
+        description: "Supabase (DEC-060): aplica supabase/migrations/ con el CLI desde el runner, por DIRECT_URL, antes del up"
+        type: boolean
+        default: false
+      ref:
+        description: "El commit del que salen los compose*.yml y las migraciones, si no es el del evento: la promoción (6.6) corre sobre el merge a `produccion` y despliega el sha de main que promovió"
+        type: string
+        default: ""
+      supabase_rama:
+        description: "Dev por rama (6.4): la rama de Supabase Branching de este entorno. Sus credenciales, por la Management API, van al .env y a la migración en lugar de las del Environment; la migración lleva además supabase/seed.sql (DEC-021)"
+        type: string
+        default: ""
+    secrets:
+      # La llave privada de deploy (DEC-014); la pública está en su authorized_keys.
+      DEPLOY_SSH_KEY:
+        required: true
+      # Las migraciones desde el runner (DEC-060). Al servidor sólo va si
+      # compose.yml la nombra (DEC-089).
+      DIRECT_URL:
+        required: false
+      # Para leer las credenciales de la rama de Supabase (supabase_rama).
+      SUPABASE_ACCESS_TOKEN:
+        required: false
+      # Lo que lee la app no se declara aquí: llega con `secrets: inherit`
+      # (y las variables, con `vars`) y lo resuelve el paso del .env contra
+      # los nombres del environment: de compose.yml (DEC-089). Cada valor es
+      # un secreto o una variable del Environment con su nombre; no hay
+      # bloques (ENV_EXTRA se rechaza).
+
+env:
+  # El servidor lo eligen las variables del repo (DEC-101): su IP y su línea
+  # de known_hosts, que no es secreto y evita un ssh-keyscan en cada corrida.
+  # Vacías, el primer paso falla nombrándolas (DEC-102).
+  SERVIDOR: ${{ vars.SERVIDOR }}
+  SERVIDOR_LLAVE: ${{ vars.SERVIDOR_LLAVE }}
+  DIR: /srv/${{ inputs.proyecto }}/${{ inputs.entorno }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ inputs.environment || inputs.entorno }}
+      url: https://${{ inputs.host }}
+    permissions:
+      contents: read
+      packages: read
+    # Dos deploys al mismo entorno se turnan; uno empezado no se corta.
+    concurrency:
+      group: deploy-${{ inputs.proyecto }}-${{ inputs.entorno }}
+      cancel-in-progress: false
+    steps:
+      # DEC-102: una variable vacía no llega a ssh ni a Traefik, cuyo error no
+      # la nombraría; nunca se cae a un servidor por omisión. Sin
+      # DOMINIO_PRUEBAS o HOST_PROD, el host del que llama queda vacío o como
+      # `x.staging.`.
+      - name: Las variables del servidor (DEC-102)
+        env:
+          HOST: ${{ inputs.host }}
+          VAR_HOST: ${{ inputs.app_env == 'prod' && 'HOST_PROD' || 'DOMINIO_PRUEBAS' }}
+        run: |
+          for v in SERVIDOR SERVIDOR_LLAVE; do
+            test -n "${!v}" || { echo "::error::Falta la variable $v en el repo (DEC-101): dice a qué servidor se despliega. Ver docs/HOWTO_desplegar-proyecto.md §5."; exit 1; }
+          done
+          if [ -z "$HOST" ] || [[ "$HOST" == .* ]] || [[ "$HOST" == *. ]]; then
+            echo "::error::El host «$HOST» no es un nombre completo: falta la variable $VAR_HOST en el repo (DEC-101). Ver docs/HOWTO_desplegar-proyecto.md §5."; exit 1
+          fi
+          echo "Servidor $SERVIDOR, host $HOST"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Llave SSH y host conocido
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy
+          printf '%s\n' "$SERVIDOR_LLAVE" > ~/.ssh/known_hosts
+          echo "SSH=ssh -i $HOME/.ssh/deploy -o BatchMode=yes -o ConnectTimeout=15 deploy@$SERVIDOR" >> "$GITHUB_ENV"
+
+      - name: Los compose*.yml del repo, al servidor (DEC-025)
+        run: |
+          $SSH "mkdir -p '$DIR'"
+          tar -cf - compose*.yml | $SSH "tar -xf - -C '$DIR'"
+
+      # La rama la crea build.yml (job supabase-rama); aquí se espera a que
+      # acepte conexiones y se toman sus credenciales. Por el pooler (§4): el
+      # host directo es sólo IPv6 y ni el servidor ni el runner lo usan.
+      - name: Credenciales de la rama de Supabase (6.4)
+        if: inputs.supabase_rama != ''
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          REF: ${{ vars.SUPABASE_PROJECT_REF }}
+          RAMA: ${{ inputs.supabase_rama }}
+        run: |
+          test -n "$SUPABASE_ACCESS_TOKEN" || { echo "falta el secreto SUPABASE_ACCESS_TOKEN en el Environment ${{ inputs.environment || inputs.entorno }}"; exit 1; }
+          test -n "$REF" || { echo "falta la variable SUPABASE_PROJECT_REF en el repo"; exit 1; }
+          # Una rama nueva tarda unos minutos en tener base; se espera hasta 10.
+          for i in $(seq 1 40); do
+            if npx --yes supabase@2.118.0 branches get "$RAMA" --project-ref "$REF" -o env > rama.env 2> rama.err; then
+              set -a; . ./rama.env; set +a
+              if [ -n "${POSTGRES_URL:-}" ] && psql "${POSTGRES_URL/:6543/:5432}" -Atqc 'select 1' > /dev/null 2>&1; then
+                break
+              fi
+            fi
+            if [ "$i" = 40 ]; then
+              echo "La rama $RAMA de Supabase no aceptó conexiones en 10 min:"; cat rama.err; exit 1
+            fi
+            sleep 15
+          done
+          echo "Claves de la rama: $(cut -d= -f1 rama.env | tr '\n' ' ')"
+          # POSTGRES_URL es el pooler en modo transacción (6543), el de la app;
+          # el mismo host en 5432 es el modo sesión, el de las migraciones (§4).
+          for par in "RAMA_DATABASE_URL=$POSTGRES_URL" "RAMA_DIRECT_URL=${POSTGRES_URL/:6543/:5432}" \
+                     "RAMA_SUPABASE_URL=$SUPABASE_URL" "RAMA_SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY" \
+                     "RAMA_SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_SERVICE_ROLE_KEY"; do
+            echo "::add-mask::${par#*=}"
+            echo "$par" >> "$GITHUB_ENV"
+          done
+          rm -f rama.env rama.err
+
+      # DEC-089: compose.yml es la única lista. De cada nombre que aparece en
+      # un `environment:` de las capas de COMPOSE_FILE se busca el valor en la
+      # rama de Supabase (RAMA_*, sólo dev), luego en los secretos y luego en
+      # las variables del Environment; lo que no está en ninguno no se
+      # escribe, y compose decide con `:?` si era obligatorio. No hay bloques:
+      # ENV_EXTRA se rechaza. Un nombre a la vez en secretos y en variables se
+      # rechaza. Lo que escribe el propio deploy (COMPOSE_*, APP_*) no se
+      # busca. Los secretos los enmascara el runner; las variables son
+      # públicas por definición.
+      - name: El .env, desde compose.yml y el Environment (DEC-089)
+        env:
+          SECRETOS: ${{ toJSON(secrets) }}
+          VARIABLES: ${{ toJSON(vars) }}
+        run: |
+          umask 077
+          if jq -e 'has("ENV_EXTRA")' <<<"$SECRETOS" >/dev/null; then
+            echo "::error::El secreto ENV_EXTRA ya no se usa (DEC-089): cada variable va con su nombre en el Environment. Bórralo y vuelve a correr."
+            exit 1
+          fi
+          propios="COMPOSE_PROJECT_NAME COMPOSE_FILE COMPOSE_PROFILES APP_HOST APP_IMAGE APP_PORT APP_HEALTH_PATH APP_ENV"
+          nombres=$(tr ':' '\n' <<<"${{ inputs.compose_file }}" | xargs grep -hoE '^\s+[A-Z][A-Z0-9_]*:' | tr -d ' :' | sort -u)
+          # Comprobaciones antes de escribir nada.
+          for n in $nombres; do
+            case " $propios " in *" $n "*)
+              if jq -e --arg n "$n" 'has($n)' <<<"$SECRETOS" >/dev/null || jq -e --arg n "$n" 'has($n)' <<<"$VARIABLES" >/dev/null; then
+                echo "::error::$n la escribe el deploy desde sus inputs: no va en el Environment (DEC-089)."; exit 1
+              fi
+              continue;;
+            esac
+            if jq -e --arg n "$n" 'has($n)' <<<"$SECRETOS" >/dev/null && jq -e --arg n "$n" 'has($n)' <<<"$VARIABLES" >/dev/null; then
+              echo "::error::$n está como secreto y como variable del Environment: tiene que ser una sola cosa (DEC-089)."; exit 1
+            fi
+          done
+          {
+            echo "# Lo escribe el deploy (run ${{ github.run_id }}, ${{ inputs.ref || github.sha }}); no se edita a mano."
+            echo "COMPOSE_PROJECT_NAME=${{ inputs.proyecto }}-${{ inputs.entorno }}"
+            echo "COMPOSE_FILE=${{ inputs.compose_file }}"
+            echo "APP_HOST=${{ inputs.host }}"
+            echo "APP_IMAGE=${{ inputs.imagen }}"
+            echo "APP_PORT=${{ inputs.puerto }}"
+            echo "APP_HEALTH_PATH=${{ inputs.ruta_salud }}"
+            echo "APP_ENV=${{ inputs.app_env }}"
+            for n in $nombres; do
+              case " $propios " in *" $n "*) continue;; esac
+              rama="RAMA_$n"
+              if [ -n "${!rama:-}" ]; then
+                valor="${!rama}"
+              elif jq -e --arg n "$n" 'has($n)' <<<"$SECRETOS" >/dev/null; then
+                valor=$(jq -r --arg n "$n" '.[$n]' <<<"$SECRETOS")
+              elif jq -e --arg n "$n" 'has($n)' <<<"$VARIABLES" >/dev/null; then
+                valor=$(jq -r --arg n "$n" '.[$n]' <<<"$VARIABLES")
+              else
+                continue
+              fi
+              # Sin el salto de línea final que deja un secreto pegado con Enter.
+              valor=$(printf '%s' "$valor" | tr -d '\r\n')
+              [ -n "$valor" ] || continue
+              # Entre comillas simples: Compose no interpola $ ni corta en # dentro
+              # de ellas, pero no admite una comilla simple escapada. Si el valor
+              # trae una, va entre dobles, escapando \ " y $ (lo que Compose sí lee).
+              if [[ "$valor" == *"'"* ]]; then
+                v="${valor//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//\$/\\\$}"
+                printf '%s="%s"\n' "$n" "$v"
+              else
+                printf "%s='%s'\n" "$n" "$valor"
+              fi
+            done
+          } > env.tmp
+          # Por stdin, no por argumentos: no pasa por la línea de comandos del servidor.
+          $SSH "umask 077 && cat > '$DIR/.env.nuevo' && mv -f '$DIR/.env.nuevo' '$DIR/.env' && test \"\$(stat -c %a '$DIR/.env')\" = 600" < env.tmp
+          echo "Escrito $DIR/.env (600) con: $(grep -v '^#' env.tmp | cut -d= -f1 | tr '\n' ' ')"
+          rm -f env.tmp
+
+      - name: Login en GHCR desde el servidor
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GITHUB_TOKEN" | $SSH "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
+
+      - name: Pull de la imagen
+        run: $SSH "cd '$DIR' && docker compose pull --quiet app"
+
+      # El CLI es de Bun y va enlazado a glibc: no corre en la imagen alpine,
+      # así que migra desde el runner, con el mismo checkout (sha) que la imagen.
+      - name: Migrar con Supabase CLI antes del up (DEC-046, DEC-060)
+        if: inputs.migrar_supabase
+        env:
+          DIRECT_URL: ${{ env.RAMA_DIRECT_URL || secrets.DIRECT_URL }}
+          # Un dev lleva semillas (DEC-021); staging y prod, nunca.
+          SEMILLA: ${{ inputs.supabase_rama != '' && '--include-seed' || '' }}
+        run: |
+          test -n "$DIRECT_URL" || { echo "falta el secreto DIRECT_URL en el Environment ${{ inputs.environment || inputs.entorno }}"; exit 1; }
+          npx --yes supabase@2.118.0 db push --db-url "$DIRECT_URL" --yes $SEMILLA
+
+      - name: Migrar dentro de la imagen antes del up (DEC-046, DEC-048)
+        if: inputs.migrar != ''
+        env:
+          MIGRAR: ${{ inputs.migrar }}
+        run: $SSH "cd '$DIR' && docker compose run --rm -T -l traefik.enable=false app sh -c '$MIGRAR'"
+
+      - name: up -d
+        run: $SSH "cd '$DIR' && docker compose up -d --remove-orphans --wait --wait-timeout 120"
+
+      - name: Lo que corre es la imagen pedida y responde
+        run: |
+          $SSH "cd '$DIR' && docker compose ps app --format json" > ps.json
+          imagen=$(jq -r '.Image' ps.json)
+          salud=$(jq -r '.Health' ps.json)
+          echo "Corre: $imagen ($salud)"
+          test "$imagen" = "${{ inputs.imagen }}"
+          test "$salud" = healthy
+          respuesta=$($SSH "cd '$DIR' && docker compose exec -T app wget -qO- 'http://127.0.0.1:${{ inputs.puerto }}${{ inputs.ruta_salud }}'")
+          echo "${{ inputs.ruta_salud }} → $respuesta"
+          {
+            echo "## Deploy a \`${{ inputs.entorno }}\`: https://${{ inputs.host }}"
+            echo "- Imagen: \`$imagen\` ($salud)"
+            echo "- \`${{ inputs.ruta_salud }}\` → \`$respuesta\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Logout de GHCR
+        if: always()
+        run: $SSH "docker logout ghcr.io" || true

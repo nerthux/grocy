@@ -1,0 +1,154 @@
+# El pipeline de Grocy, desde plantillas/github/workflows/build.yml de infra
+# (docs/PLAN_despliegue.md §3). En cada push corre la CI (ci.yml, como job
+# reutilizable) y, si pasa, construye la imagen una sola vez y la sube a
+# GHCR etiquetada con el sha completo del commit: ghcr.io/nerthux/grocy:<sha>.
+# Sólo en release, además, la re-etiqueta prod-AAAAMMDD-N y la despliega a
+# /srv/grocy/prod/ (DEC-009). Sin staging ni dev por rama (DEC-008): la rama
+# de un sprint construye y sube su imagen, pero no despliega.
+name: Build
+
+on:
+  push:
+    # DEC-023 de infra: un push sólo de documentación no construye ni despliega.
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Un push nuevo a la misma rama cancela la corrida anterior, salvo en
+# release: ahí la corrida despliega a producción y cortarla podría dejarla a
+# medias. En release las corridas se turnan.
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ubuntu-24.04
+    outputs:
+      # Para los jobs de deploy: la imagen con su tag y su digest.
+      image: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          # metadata-action pasa el nombre a minúsculas, que GHCR exige.
+          images: ghcr.io/${{ github.repository }}
+          # Sólo el sha completo; el prod-AAAAMMDD-N lo pone `promover`.
+          tags: type=sha,format=long,prefix=
+      - id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: GIT_SHA=${{ github.sha }}
+      # Comprueba desde fuera del build que el tag ya está en GHCR, y deja
+      # imagen y digest en el resumen del run.
+      - name: La imagen está en GHCR
+        run: |
+          docker buildx imagetools inspect "${{ steps.meta.outputs.tags }}"
+          {
+            echo "Imagen: \`${{ steps.meta.outputs.tags }}\`"
+            echo "Digest: \`${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # El retag de produccion.yml de infra, pero sobre la imagen que acaba de
+  # construir este push: en release no hay PR del que sacar el sha.
+  promover:
+    needs: build
+    if: github.ref == 'refs/heads/release'
+    runs-on: ubuntu-24.04
+    outputs:
+      imagen: ${{ steps.tag.outputs.imagen }}
+    steps:
+      # DEC-102 de infra, antes del retag: si no, el prod-* se crearía y
+      # deploy.yml lo rechazaría después, dejando un tag que nunca llegó a
+      # producción.
+      - name: Las variables del servidor (DEC-102)
+        env:
+          SERVIDOR: ${{ vars.SERVIDOR }}
+          SERVIDOR_LLAVE: ${{ vars.SERVIDOR_LLAVE }}
+          HOST_PROD: ${{ vars.HOST_PROD }}
+        run: |
+          for v in SERVIDOR SERVIDOR_LLAVE HOST_PROD; do
+            test -n "${!v}" || { echo "::error::Falta la variable $v en el repo (DEC-101): dice a qué servidor se despliega. Ver docs/HOWTO_desplegar-proyecto.md §5."; exit 1; }
+          done
+
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # prod-AAAAMMDD-N: la fecha, en hora de Tijuana; el N, uno más que el
+      # mayor de ese día en el paquete. Los tags se leen de la API del
+      # registro con el GITHUB_TOKEN.
+      - id: tag
+        name: Retag a prod-AAAAMMDD-N, sin rebuild
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGEN_SHA: ${{ needs.build.outputs.image }}
+        run: |
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          fecha=$(TZ=America/Tijuana date +%Y%m%d)
+          token=$(printf '%s' "$GITHUB_TOKEN" | base64 -w0)
+          curl -fsS -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/${GITHUB_REPOSITORY,,}/tags/list?n=10000" > tags.json
+          # El shell de Actions corre con pipefail: sin tags del día, el grep
+          # sale con 1 y no debe tumbar el paso.
+          n=$(jq -r --arg p "prod-$fecha-" '(.tags // [])[] | select(startswith($p)) | ltrimstr($p)' tags.json \
+                | { grep -E '^[0-9]+$' || true; } | sort -n | tail -1)
+          tag="prod-$fecha-$(( ${n:-0} + 1 ))"
+          docker buildx imagetools create -t "$REPO:$tag" "$IMAGEN_SHA"
+          origen=$(docker buildx imagetools inspect "$IMAGEN_SHA" --format '{{json .Manifest.Digest}}')
+          destino=$(docker buildx imagetools inspect "$REPO:$tag" --format '{{json .Manifest.Digest}}')
+          echo "$IMAGEN_SHA → $origen"; echo "$tag → $destino"
+          test "$origen" = "$destino"
+          echo "imagen=$REPO:$tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Promoción: \`$tag\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Imagen: \`$REPO:$tag\` = \`$IMAGEN_SHA\`"
+            echo "- Digest: \`$destino\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # deploy.yml con el entorno prod: /srv/grocy/prod/, compose.prod.yml y el
+  # host HOST_PROD (DEC-101). Grocy migra solo al arrancar: no hay paso de
+  # migración. Nginx escucha en el 8080 y /login es la ruta que responde 200
+  # sin redirigir (`/` va a GROCY_BASE_URL).
+  deploy-prod:
+    needs: promover
+    uses: ./.github/workflows/deploy.yml
+    with:
+      entorno: prod
+      proyecto: ${{ github.event.repository.name }}
+      host: ${{ vars.HOST_PROD }}
+      imagen: ${{ needs.promover.outputs.imagen }}
+      app_env: prod
+      compose_file: compose.yml:compose.prod.yml
+      puerto: "8080"
+      ruta_salud: /login
+    # Los secretos los resuelve deploy.yml contra su Environment.
+    secrets: inherit

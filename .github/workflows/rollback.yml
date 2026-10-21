@@ -1,0 +1,126 @@
+# 6.7: el botón «Rollback» (docs/PLAN_cicd.md §2). Vuelve a
+# desplegar en /srv/<proyecto>/prod/ el prod-* anterior al que corre, o el
+# que se le pida, con deploy.yml y sin rebuild (principio 3). No crea tags:
+# APP_IMAGE queda en el prod-* viejo, y correrlo otra vez retrocede uno más.
+# **No corre migraciones ni las deshace**: si entre los dos prod-* hubo una
+# migración que la versión vieja no tolera, el rollback no basta (README de
+# plantillas/github). Se copia tal cual a .github/workflows/rollback.yml del
+# repo del proyecto; servidor y host salen de las variables del repo
+# (DEC-101), como en produccion.yml.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "El prod-AAAAMMDD-N al que volver; vacío, el anterior al que corre"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+# El mismo grupo que produccion.yml: una promoción y un rollback se turnan.
+concurrency:
+  group: produccion
+  cancel-in-progress: false
+
+env:
+  SERVIDOR: ${{ vars.SERVIDOR }}
+  SERVIDOR_LLAVE: ${{ vars.SERVIDOR_LLAVE }}
+
+jobs:
+  elegir:
+    runs-on: ubuntu-24.04
+    # Por la DEPLOY_SSH_KEY de prod: lo que corre se lee del .env del servidor.
+    environment: prod
+    outputs:
+      sha: ${{ steps.elegir.outputs.sha }}
+      imagen: ${{ steps.elegir.outputs.imagen }}
+    steps:
+      # DEC-102, como en deploy.yml.
+      - name: Las variables del servidor (DEC-102)
+        run: |
+          for v in SERVIDOR SERVIDOR_LLAVE; do
+            test -n "${!v}" || { echo "::error::Falta la variable $v en el repo (DEC-101): dice a qué servidor se despliega. Ver docs/HOWTO_desplegar-proyecto.md §5."; exit 1; }
+          done
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: elegir
+        name: El prod-* al que se vuelve
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PEDIDO: ${{ inputs.tag }}
+          PROYECTO: ${{ github.event.repository.name }}
+        run: |
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy
+          printf '%s\n' "$SERVIDOR_LLAVE" > ~/.ssh/known_hosts
+
+          # Lo que corre: el APP_IMAGE que escribió el último deploy.
+          actual=$(ssh -i ~/.ssh/deploy -o BatchMode=yes -o ConnectTimeout=15 "deploy@$SERVIDOR" \
+                     "sed -n 's/^APP_IMAGE=//p' '/srv/$PROYECTO/prod/.env'")
+          actual_tag=${actual##*:}
+          echo "Corre: $actual"
+
+          # Los prod-* del paquete, del más viejo al más nuevo (fecha y N).
+          token=$(printf '%s' "$GITHUB_TOKEN" | base64 -w0)
+          curl -fsS -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/${GITHUB_REPOSITORY,,}/tags/list?n=10000" \
+            | jq -r '(.tags // [])[]' | { grep -E '^prod-[0-9]{8}-[0-9]+$' || true; } \
+            | sort -t- -k2,2n -k3,3n > prod.txt
+          echo "prod-* en GHCR: $(tr '\n' ' ' < prod.txt)"
+
+          if [ -n "$PEDIDO" ]; then
+            grep -qx -- "$PEDIDO" prod.txt || { echo "$PEDIDO no es un prod-* de $REPO"; exit 1; }
+            tag=$PEDIDO
+          else
+            grep -qx -- "$actual_tag" prod.txt || { echo "Lo que corre ($actual) no es un prod-*: di a cuál volver con el input tag"; exit 1; }
+            tag=$(grep -x -B1 -- "$actual_tag" prod.txt | head -1)
+            test "$tag" != "$actual_tag" || { echo "$actual_tag es el primer prod-*: no hay anterior"; exit 1; }
+          fi
+          test "$tag" != "$actual_tag" || { echo "$tag ya es lo que corre"; exit 1; }
+
+          # El commit de la imagen, de su etiqueta OCI (la pone metadata-action
+          # en build.yml): de ahí salen los compose*.yml del deploy.
+          sha=$(docker buildx imagetools inspect "$REPO:$tag" --format '{{json .Image}}' \
+                  | jq -r 'first(.. | objects | .Labels? // empty | ."org.opencontainers.image.revision" // empty)')
+          echo "$sha" | grep -qE '^[0-9a-f]{40}$' || { echo "$REPO:$tag no trae org.opencontainers.image.revision"; exit 1; }
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "imagen=$REPO:$tag" >> "$GITHUB_OUTPUT"
+          echo "Rollback: $actual_tag → $tag ($sha)"
+          {
+            echo "## Rollback: \`$actual_tag\` → \`$tag\`"
+            echo "- Commit: \`$sha\`"
+            echo "- Sin migraciones: lo que haya migrado \`$actual_tag\` se queda."
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f ~/.ssh/deploy
+
+  # 6.3 con el entorno prod, como en produccion.yml, pero sin migrar: el
+  # rollback no toca la base.
+  deploy-prod:
+    needs: elegir
+    uses: ./.github/workflows/deploy.yml
+    with:
+      entorno: prod
+      proyecto: ${{ github.event.repository.name }}
+      host: ${{ vars.HOST_PROD }}
+      imagen: ${{ needs.elegir.outputs.imagen }}
+      ref: ${{ needs.elegir.outputs.sha }}
+      app_env: prod
+      compose_file: compose.yml:compose.prod.yml
+      # Grocy: nginx en el 8080 y /login, que no redirige (compose.yml).
+      puerto: "8080"
+      ruta_salud: /login
+      migrar_supabase: false
+    secrets: inherit

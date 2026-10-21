@@ -1,0 +1,34 @@
+# La CI mínima de Grocy (docs/PLAN_despliegue.md §3): `php -l` del PHP del
+# fork y `bash -n` del arranque, con el mismo PHP que el Dockerfile. Corre en
+# cada PR por su cuenta y en cada push como job de build.yml, que la llama
+# con workflow_call. No construye la imagen: eso es de build.yml, y que
+# construya ya es la prueba de que el Dockerfile sirve.
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Un push nuevo a la misma rama cancela la corrida anterior, salvo en
+# release, donde cada push pasa su CI y se despliega a producción (DEC-009).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    # La misma base que el Dockerfile: composer.json exige php 8.5.*.
+    container: php:8.5-cli-trixie
+    steps:
+      - uses: actions/checkout@v7
+      - name: php -l
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -not -path './packages/*' -not -path './.git/*' -print0 \
+            | xargs -0 -n1 php -l > /dev/null
+          echo "PHP sin errores de sintaxis: $(find . -name '*.php' -not -path './vendor/*' -not -path './packages/*' -not -path './.git/*' | wc -l) archivos"
+      - name: bash -n del arranque
+        run: bash -n docker/entrypoint.sh
