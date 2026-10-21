@@ -1,0 +1,23 @@
+# Prueba local de la imagen propia. No es el compose del despliegue: ése será
+# compose.yml, con la plantilla de infra. Se parametriza con .env (ver
+# .env.example); con COMPOSE_FILE ahí, basta `docker compose up`.
+
+services:
+  grocy:
+    build: .
+    image: grocy:local
+    container_name: ${GROCY_CONTENEDOR:?falta GROCY_CONTENEDOR en .env}
+    security_opt:
+      - no-new-privileges:true
+    # Sólo en localhost: es una prueba, no un servicio de la red
+    ports:
+      - "127.0.0.1:${GROCY_PUERTO:?falta GROCY_PUERTO en .env}:8080"
+    environment:
+      # nginx no le pasa el puerto a Grocy en HTTP_HOST; sin esto, las
+      # redirecciones van a http://localhost/ sin puerto
+      GROCY_BASE_URL: http://localhost:${GROCY_PUERTO}
+    volumes:
+      - datos:/var/www/grocy/data
+
+volumes:
+  datos: {}
